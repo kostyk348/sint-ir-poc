@@ -1,88 +1,121 @@
-# sint-ir-poc
+# SINT IR PoC — a multilingual "brick" for reimplement functions
 
-Минимальный исполняемый S-expression IR (Lisp-подобный AST):
-парсер + интерпретатор + C-генератор на чистом Python.
-Цель — быстрая валидация reimplement-функций macOS-фреймворков
-(контекст Darling / VibeDarling): интерпретация на мок-корпусе,
-сравнение с оригиналом, затем генерация C. Ни один тест не является
-захардкоженным кодом — все функции существуют только как Lisp-текст.
+One file, one IR, two engines. A tiny s-expression IR that cheaply states a leaf
+function, runs it on both a **Python** interpreter and an **SBCL (Common Lisp)**
+interpreter, emits equivalent C, and validates the result against a fixed test
+corpus with gcc. The point is method, not scale: the first local proof that a
+*clean-room reimplement workflow* can be anchored by a mechanical artifact
+rather than prose.
 
-## Результат
+## What you get
 
 ```
-interp tests: 11/11 passed   (sqr, euclidian_distance, centerSizeInRect)
-[C] gcc -Wall -Wextra -fsyntax-only: OK
-[TIMING] avg 0.217 ms/cycle over 20 runs (parse + 11 tests)
+S-expression IR  ──parse──►  tree  ──eval──►  interpreter    (Python)   (SBCL)
+                          │
+                          └──c-emit──►  C source  ──gcc -Wall -Wextra──►  OK
 ```
 
-Критерий «валидация кандидата < 1 секунды» перекрыт на ~4 порядка.
+* Both engines read the SAME IR text and emit the SAME C — the IR is the
+  single source of truth.
+* Two engines on purpose: Python for speed of hacking, SBCL for a compiled
+  runtime so the checks do not stay as a "toy script". Different runtimes,
+  identical spec.
+* `gcc -Wall -Wextra` has to accept every emitted C — the C text is real, not
+  aspirational.
 
-## Синтаксис IR (плоский)
+## Features in the IR
 
-```lisp
-(:function sqr :params (:v CGFloat) :ret CGFloat
-  :body (* :v :v))
+* `(:function name :params (:p1 Type :p2 Type) :ret Type :body FORM)`
+* arithmetic `(+)`, `(-)`, `(*)`, `(/)`, `sqrt`, `min` / `max` — semantic
+  `(max | cd28 | <)`, `abs`, struct `:field` accesses, opaque `:call`s
+  (function-call emission).
+* **bit operations**, written as words to keep both reader nests cheap
+  and Common Lisp portable: `xor` / `and` / `shl` / `shr`
+* **state + loops** — `(:let (:a …) stmt…)`, `(:loop N stmt…:last :set)`,
+  `(:set name expr)`
+* `UInt32` type (`uint32_t` in C; `Logxor/Logand/Ash` in SBCL, same
+  two's-complement wrap-around semantics with GNU statement-expressions).
+
+## The CRC32 clean-room marker
+
+The test corpus contains a reimplemented IEEE CRC-32, built ONLY from the
+public spec (poly 0xEDB88320, init 0xFFFFFFFF, final xor) — this is the exact
+function we detected inside the `kekatar` binary of Keka.app (both x86_64 and
+arm64 Mach-O slices carry the table).
+No Keka source code was read. The little `.c`
+file that gcc accepts at the end is what the clean-room record looks like.
+
+```
+(:function crc32_step :params (:crc UInt32 :b UInt32) :ret UInt32
+  :body (:let (:crc2 (xor :crc :b))
+    (:loop 8
+      (:set :crc2 (:if (and :crc2 1)
+                    (xor (shr :crc2 1) 3988292384)
+                    (shr :crc2 1))))))
+
+(:function crc32_full :params (:b1 UInt32 :b2 UInt32 :b3 UInt32 :b4 UInt32
+                               :b5 UInt32 :b6 UInt32 :b7 UInt32 :b8 UInt32
+                               :b9 UInt32) :ret UInt32
+  :body (xor (:call crc32_step …9 nested… ) 4294967295))
 ```
 
-Типы: `CGFloat`→`double`, `NSSize`, `NSPoint`, `NSRect`.
-Формы: `:function`, `:if`, `:field`, `:call`; числа и символы различаются
-анализом токена (0 обязан выживать).
+Vectors: step `4294967295 + 49 → 2082672712`, `2082672712 + 50 → 2964110130`,
+`2964110130 + 51 → 2008521773`; full `49 50 51 52 53 54 55 56 57 → 3421780262`
+(zlib.crc32(b"123456789") = 0xCBF43926).
 
-## Тестируемые функции (эталон из Darling)
+## Run
 
-- `sqr` — NSGradient.m:346 (3 теста)
-- `euclidian_distance` — NSGradient.m:351 (5 тестов)
-- `centerSizeInRect` — NSSplitView.m:985 (3 теста)
+```
+# Python engine
+python3 sexpr_ir_poc.py
 
-## Живое доказательство, что это настоящий интерпретатор
-
-Функции, которых никогда не было в коде, исполняются тем же путём
-(tokenize → parse → eval):
-
-```lisp
-(:function clamp :params (:lo CGFloat :v CGFloat :hi CGFloat) :ret CGFloat
-  :body (:if (< :v :lo) :lo (:if (> :v :hi) :hi :v)))
-;; clamp(0, -7, 3) = 0.0, clamp(2, 9, 8) = 8.0 — вложенные :if работают
-(:function max3 :params (:a CGFloat :b CGFloat :c CGFloat) :ret CGFloat
-  :body (:call max :a (:call max :b :c)))
-;; max3(1,2,3) = 3.0 — композиция функций работает
+# SBCL engine (SBCL 2.6.x; if installed to /usr/local/sbcl, set SBCL_HOME)
+SBCL_HOME=/usr/local/sbcl/lib sbcl --noinform --load sexpr_ir_sbcl.lisp \
+    --eval '(ir-poc:main)' --eval '(sb-ext:exit)'
 ```
 
-Кривая формула со случайными аргументами вернула буквально вычисленный
-результат, а не «правильный» — критерий настоящего исполнителя.
+Current status (both engines):
 
-## Найденные и исправленные баги (все три реальны, каждый ловится тестом)
-
-1. `parse` перезаписывал top-level формы: `tree = node` при новой форме
-   терял все предыдущие (`stack, tree = [], None`). Фикс: накапливать
-   в `roots`-список. Симптом: `no IR function named 'sqr'`, пустой C.
-2. `c_expr` для `:call` брал аргументы из `node[1:]` вместо `node[2:]` —
-   callee попадал в аргументы: `sqr(sqr, (ax-bx))`, `{ point, ... }`.
-3. `:call midx/midy` в C — это helper-макросы, а не функции: эмиссия
-   должна быть uppercase `MIDX(inRect)`, иначе `implicit declaration`.
-
-## Запуск
-
-```sh
-python3 sexpr_ir_poc.py                                        # движок 1: Python
-SBCL_HOME=/usr/local/sbcl/lib sbcl --load sexexpr_ir_sbcl.lisp \
-  --eval "(ir-poc:main)"                                       # движок 2: Common Lisp
+```
+interp tests: 15/15 passed
+[C]  gcc -Wall -Wextra -fsyntax-only: OK
 ```
 
-Движок 2 (SBCL): 11/11, gcc OK, avg 0.056 ms/cycle — native reader
-вместо рукописного парсера). Динамический REPL: `SBCL_HOME=... sbcl
---load sexpr_ir_sbcl.lisp --eval "(ir-poc:repl)"`.
+Python: parse + 15 tests ≈ 0.8 ms/cycle. SBCL: ≈ 0.1–0.3 ms/cycle.
+
+## Files
+
+* `sexpr_ir_poc.py` — Python engine: tokenizer, parser, interpreter,
+  C emitter, gcc check.
+* `sexpr_ir_sbcl.lisp` — the Common Lisp (SBCL) engine, same IR, same C,
+  same tests; also gives you a `--eval '(ir-poc:repl)'` for REPL-mode.
+* `README.md` — this file.
+
+## Design rules (what makes this a "reimplement brick")
+
+1. **The IR is the ONLY place functions are written by hand.** Everything down
+   (C) and everything across (engine 2) is derived.
+2. **Tests next to functions.** A function without vectors does not exist.
+3. **Numbers over prose.** "PASS", "FAIL", timings printed by the engine.
+4. **It's not the target of where this leads — the method is.** SINT's
+   reimplement method (disassembly-only clean room → leaf-function IR →
+   mechanical check) is what this is a PoC of. Scale-up plans live outside.
 
 ## Roadmap
 
-- [x] Порт на Common Lisp (SBCL) — `sexpr_ir_sbcl.lisp`: 11/11 PASS,
-      gcc OK, 0.056 ms/cycle; два независимых движка дают бит-в-бит
-      одинаковые результаты на одном IR.
-- Расширение корпуса: `integralRect` (NSClipView.m:56),
-  `computePeriod` (NSTableView.m:3437) — стресс-тест `:if` на реальных
-  ветвлениях из Darling.
-- Clean room на реальном macOS-приложении: цель выбрана — `kekatar`
-  из Keka.app (inline CRC32-таблица с IEEE-полиномом 0xEDB88320,
-  подтверждено по данным бинарника: table[1] = 0x77073096 в обоих
-  слайсах x86_64/arm64); ground truth — публичный IEEE-спек,
-  disassembly-only, без чтения исходников.
+- [x] Python engine: parse, interp, C emit, gcc check — 11/11 basic corpus
+- [x] SBCL (Common Lisp) port — full parity of IR, C emission, 11/11, REPL
+- [x] Clean-room CRC32 via `:let` / `:loop` / `:set` + `xor/and/shl/shr`
+      — 15/15 on both engines, both C emissions gcc-clean
+- [x] Second clean-room target confirmed: `kekatar` (Keka.app) carries inline
+      IEEE CRC32 (table[1] = 0x77073096, poly 0xEDB88320) — identified from
+      binary data only
+- [ ] Embed the method into the reimplement workflow
+      (`VibeDarling/darling-appkit-gui` as its forked backend: clean-room
+      leaf-function checks, AppKit reimplement context).
+- [ ] Optional: Ghidra headless BatchRun on clean-room targets for a
+      structured loop of RE → IR → test.
+
+## License
+
+Same license as the repository (MIT unless stated otherwise).

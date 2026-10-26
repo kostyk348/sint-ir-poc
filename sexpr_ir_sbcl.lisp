@@ -26,7 +26,17 @@
     (+ (:field :inRect :x)
        (max (- (:call midx :inRect) (/ (:field :innerSize :width) 2.0)) 0))
     (+ (:field :inRect :y)
-       (max (- (:call midy :inRect) (/ (:field :innerSize :height) 2.0)) 0))))")
+       (max (- (:call midy :inRect) (/ (:field :innerSize :height) 2.0)) 0))))
+
+(:function crc32_step :params (:crc UInt32 :b UInt32) :ret UInt32
+  :body (:let (:crc2 (xor :crc :b))
+    (:loop 8
+      (:set :crc2 (:if (and :crc2 1)
+                    (xor (shr :crc2 1) 3988292384)
+                    (shr :crc2 1))))))
+
+(:function crc32_full :params (:b1 UInt32 :b2 UInt32 :b3 UInt32 :b4 UInt32 :b5 UInt32 :b6 UInt32 :b7 UInt32 :b8 UInt32 :b9 UInt32) :ret UInt32
+  :body (xor (:call crc32_step (:call crc32_step (:call crc32_step (:call crc32_step (:call crc32_step (:call crc32_step (:call crc32_step (:call crc32_step (:call crc32_step 4294967295 :b1) :b2) :b3) :b4) :b5) :b6) :b7) :b8) :b9) 4294967295))")
 
 ;; parser
 
@@ -80,6 +90,8 @@
 
 (defun ffloat (x) (float x 1.0d0))
 
+(defun ir-int (x) (if (integerp x) x (truncate (ffloat x))))
+
 (defun lookup-env (env sym)
   (gethash (string-upcase (symbol-name sym)) env))
 
@@ -130,6 +142,10 @@
     ((string= op "MIN") (reduce #'min vals :key #'ffloat))
     ((string= op "SQRT") (sqrt (ffloat (first vals))))
     ((string= op "ABS") (abs (ffloat (first vals))))
+    ((string= op "XOR") (logxor (ir-int (first vals)) (ir-int (second vals))))
+    ((string= op "AND") (logand (ir-int (first vals)) (ir-int (second vals))))
+    ((string= op "SHL") (ash (ir-int (first vals)) (ir-int (second vals))))
+    ((string= op "SHR") (ash (ir-int (first vals)) (- (ir-int (second vals)))))
     ((string= op "POINT") (ir-point vals))
     ((string= op "MIDX") (ir-midx vals))
     ((string= op "MIDY") (ir-midy vals))
@@ -147,7 +163,7 @@
   (let ((op (string-upcase (symbol-name (car form)))))
     (cond
       ((string= op "IF")
-       (if (eval-node (second form) env)
+       (if (/= (eval-node (second form) env) 0)
            (eval-node (third form) env)
            (eval-node (fourth form) env)))
       ((string= op "FIELD")
@@ -160,6 +176,24 @@
            ((string= cname "POINT") (ir-point args))
            ((gethash cname *fn-table*) (call-fn cname args))
            (t (apply-ir-op cname args)))))
+      ((string= op "LET")
+       (let ((b (second form)))
+         (loop for j from 0 below (length b) by 2
+               do (setf (gethash (string-upcase (symbol-name (nth j b))) env)
+                        (eval-node (nth (1+ j) b) env)))
+         (loop for s in (cddr form)
+               with result = nil
+               do (setf result (eval-node s env))
+               finally (return result))))
+      ((string= op "LOOP")
+       (loop for i from 1 to (truncate (second form))
+             with result = nil
+             do (loop for s in (cddr form)
+                      do (setf result (eval-node s env)))
+             finally (return result)))
+      ((string= op "SET")
+       (setf (gethash (string-upcase (symbol-name (second form))) env)
+             (eval-node (third form) env)))
       (t (apply-ir-op op
                       (mapcar (lambda (a) (eval-node a env)) (cdr form)))))))
 
@@ -203,7 +237,13 @@
        (0.0d0 0.0d0))
       (((:width 2.0d0 :height 2.0d0)
         (:x 0.0d0 :y 0.0d0 :width 4.0d0 :height 4.0d0))
-       (1.0d0 1.0d0))))))
+       (1.0d0 1.0d0))))
+    ("crc32_step"
+     (((4294967295 49) 2082672712)
+      ((2082672712 50) 2964110130)
+      ((2964110130 51) 2008521773)))
+    ("crc32_full"
+     (((49 50 51 52 53 54 55 56 57) 3421780262)))))
 
 (defun points-p (x) (and (consp x) (every #'numberp x)))
 
@@ -239,6 +279,7 @@
 (defparameter *preamble*
   "/* generated from s-expression IR (PoC): parse_IR -> emit_C */
 #include <math.h>
+#include <stdint.h>
 #ifndef MAX
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -254,6 +295,7 @@ typedef struct { CGFloat x, y, width, height; } NSRect;
 (defun c-type (t-sym)
   (let ((u (string-upcase (symbol-name t-sym))))
     (cond ((string= u "CGFLOAT") "double")
+          ((string= u "UINT32")  "uint32_t")
           ((string= u "NSSIZE")  "NSSize")
           ((string= u "NSPOINT") "NSPoint")
           ((string= u "NSRECT")  "NSRect")
@@ -282,8 +324,42 @@ typedef struct { CGFloat x, y, width, height; } NSRect;
           ((string= (string-upcase (symbol-name op)) "FIELD")
            (format nil "~A.~A"
                    (c-expr (second node)) (symbol-name (third node))))
+          ((string= (string-upcase (symbol-name op)) "LET")
+           (let ((b (second node))
+                 (body (cddr node))
+                 (o (make-string-output-stream)))
+             (princ "({ " o)
+             (loop for j from 0 below (length b) by 2
+                   do (format o "uint32_t ~A = ~A; "
+                              (symbol-name (nth j b))
+                              (c-expr (nth (1+ j) b))))
+             (loop for s in body do (princ (c-expr s) o))
+             (when (and body
+                        (not (string= (string-upcase (symbol-name (car (car (last body))))) "SET")))
+               (princ "; " o))
+             (princ "})" o)
+             (get-output-stream-string o)))
+          ((string= (string-upcase (symbol-name op)) "LOOP")
+           (let ((n (second node))
+                 (body (cddr node))
+                 (name (and (car (last (cddr node)))
+                            (consp (car (last (cddr node))))
+                            (string= (string-upcase (symbol-name (car (car (last (cddr node)))))) "SET")
+                            (symbol-name (second (car (last (cddr node))))))))
+             (with-output-to-string (o)
+               (princ "({ for (int _i = 0; _i < " o)
+               (princ (fmt-num n) o)
+               (princ "; ++_i) { " o)
+               (loop for s in body do (princ (c-expr s) o))
+               (princ " } " o)
+               (when name (princ name o))
+               (princ "; })" o))))
+          ((string= (string-upcase (symbol-name op)) "SET")
+           (format nil "~A = ~A; "
+                   (symbol-name (second node))
+                   (c-expr (third node))))
           (t
-           (let* ((callee (symbol-name (second node)))
+            (let* ((callee (symbol-name (second node)))
                   (raw-up (string-upcase callee))
                   (args (mapcar #'c-expr (cddr node))))
              (cond
@@ -310,6 +386,10 @@ typedef struct { CGFloat x, y, width, height; } NSRect;
             ((member u '("<" ">" "==") :test #'string=)
              (format nil "(~A ~A ~A)"
                      (first args) (if (string= u "==") "==" u) (second args)))
+            ((string= u "XOR") (format nil "((uint32_t)(~A) ^ (uint32_t)(~A))" (first args) (second args)))
+            ((string= u "AND") (format nil "((uint32_t)(~A) & (uint32_t)(~A))" (first args) (second args)))
+            ((string= u "SHL") (format nil "((uint32_t)(~A) << (uint32_t)(~A))" (first args) (second args)))
+            ((string= u "SHR") (format nil "((uint32_t)(~A) >> (uint32_t)(~A))" (first args) (second args)))
             (t (error "no C emission for op: ~A" (symbol-name op))))))))
 
 (defun param-decls (params)

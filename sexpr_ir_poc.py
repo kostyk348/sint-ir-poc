@@ -27,9 +27,19 @@ IR_SOURCE = """
   :ret NSPoint
   :body (:call point
     (+ (:field :inRect :x)
-       (max (- (:call midx :inRect) (/ (:field :innerSize :width) 2)) 0))
+       (max (- (:call midx :inRect) (/ (:field :innerSize :width) 2.0)) 0))
     (+ (:field :inRect :y)
-       (max (- (:call midy :inRect) (/ (:field :innerSize :height) 2)) 0))))
+       (max (- (:call midy :inRect) (/ (:field :innerSize :height) 2.0)) 0))))
+
+(:function crc32_step :params (:crc UInt32 :b UInt32) :ret UInt32
+  :body (:let (:crc2 (xor :crc :b))
+    (:loop 8
+      (:set :crc2 (:if (and :crc2 1)
+                    (xor (shr :crc2 1) 3988292384)
+                    (shr :crc2 1))))))
+
+(:function crc32_full :params (:b1 UInt32 :b2 UInt32 :b3 UInt32 :b4 UInt32 :b5 UInt32 :b6 UInt32 :b7 UInt32 :b8 UInt32 :b9 UInt32) :ret UInt32
+  :body (xor (:call crc32_step (:call crc32_step (:call crc32_step (:call crc32_step (:call crc32_step (:call crc32_step (:call crc32_step (:call crc32_step (:call crc32_step 4294967295 :b1) :b2) :b3) :b4) :b5) :b6) :b7) :b8) :b9) 4294967295))
 """
 
 # --- parser -----------------------------------------------------------------
@@ -112,6 +122,10 @@ OPS = {
     "min": lambda a: min(a),
     "sqrt": lambda a: math.sqrt(a[0]),
     "abs": lambda a: abs(a[0]),
+    "xor": lambda a: int(a[0]) ^ int(a[1]),
+    "and": lambda a: int(a[0]) & int(a[1]),
+    "shl": lambda a: int(a[0]) << int(a[1]),
+    "shr": lambda a: int(a[0]) >> int(a[1]),
     "<": lambda a: a[0] < a[1],
     ">": lambda a: a[0] > a[1],
     "==": lambda a: a[0] == a[1],
@@ -155,6 +169,23 @@ def eval_node(node, env, tree):
             return call_fn(tree, callee, [eval_node(a, env, tree) for a in node[2:]])
         args = [eval_node(a, env, tree) for a in node[2:]]
         return OPS[callee](args)
+    if op == ":let":
+        b, body = node[1], node[2:]
+        for j in range(0, len(b), 2):
+            env[b[j].lstrip(":")] = eval_node(b[j + 1], env, tree)
+        result = None
+        for stmt in body:
+            result = eval_node(stmt, env, tree)
+        return result
+    if op == ":loop":
+        n, body, result = node[1], node[2:], None
+        for _ in range(int(n)):
+            for stmt in body:
+                result = eval_node(stmt, env, tree)
+        return result
+    if op == ":set":
+        env[node[1].lstrip(":")] = eval_node(node[2], env, tree)
+        return env[node[1].lstrip(":")]
     if op not in OPS:
         raise LookupError("unsupported op in IR: %r" % (op,))
     args = [eval_node(a, env, tree) for a in node[1:]]
@@ -204,6 +235,14 @@ TESTS = {
             (1.0, 1.0),
         ),
     ],
+    "crc32_step": [
+        ([4294967295, 49], 2082672712),
+        ([2082672712, 50], 2964110130),
+        ([2964110130, 51], 2008521773),
+    ],
+    "crc32_full": [
+        ([49, 50, 51, 52, 53, 54, 55, 56, 57], 3421780262),
+    ],
 }
 TOLERANCE = 1e-9
 
@@ -235,6 +274,7 @@ def run_tests(tree):
 PREAMBLE = """\
 /* generated from s-expression IR (PoC): parse_IR -> emit_C */
 #include <math.h>
+#include <stdint.h>
 #ifndef MAX
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -247,10 +287,12 @@ typedef struct { CGFloat width, height; } NSSize;
 typedef struct { CGFloat x, y, width, height; } NSRect;
 """
 
-TYPE_MAP = {"CGFloat": "double", "NSSize": "NSSize", "NSPoint": "NSPoint", "NSRect": "NSRect"}
+TYPE_MAP = {"CGFloat": "double", "NSSize": "NSSize", "NSPoint": "NSPoint", "NSRect": "NSRect", "UInt32": "uint32_t"}
 
 
 def c_num(node):
+    if isinstance(node, int):
+        return str(node)
     return "%r" % float(node)
 
 
@@ -260,7 +302,9 @@ def c_expr(node):
     if not isinstance(node, list):
         return node.lstrip(":")
     op = node[0]
-    a = [c_expr(x) for x in node[1:]]
+    a = []
+    if op not in (":let", ":set", ":loop"):
+        a = [c_expr(x) for x in node[1:]]
     if op == ":field":
         return "%s.%s" % (c_expr(node[1]), node[2].lstrip(":"))
     if op == ":call":
@@ -291,6 +335,34 @@ def c_expr(node):
         return "fabs(%s)" % a[0]
     if op in ("<", ">", "=="):
         return "(%s %s %s)" % (a[0], op, a[1])
+    if op == "xor":
+        return "((uint32_t)(%s) ^ (uint32_t)(%s))" % (a[0], a[1])
+    if op == "and":
+        return "((uint32_t)(%s) & (uint32_t)(%s))" % (a[0], a[1])
+    if op == "shl":
+        return "((uint32_t)(%s) << (uint32_t)(%s))" % (a[0], a[1])
+    if op == "shr":
+        return "((uint32_t)(%s) >> (uint32_t)(%s))" % (a[0], a[1])
+    if op == ":set":
+        return "%s = %s; " % (node[1].lstrip(":"), c_expr(node[2]))
+    if op == ":loop":
+        n, body = int(node[1]), node[2:]
+        last = body[-1]
+        name = last[1].lstrip(":") if last[0] == ":set" else ""
+        stmts = "".join(c_expr(s) for s in body)
+        return "({ for (int _i = 0; _i < %d; ++_i) { %s } %s; })" % (n, stmts, name)
+    if op == ":let":
+        b = node[1]
+        decls = " ".join(
+            "uint32_t %s = %s; " % (b[j].lstrip(":"), c_expr(b[j + 1]))
+            for j in range(0, len(b), 2)
+        )
+        body = node[2:]
+        stmts = "".join(c_expr(s) for s in body)
+        if body and body[-1][0] != ":set":
+            stmts += "; "
+        return "({ %s%s })" % (decls, stmts)
+        return "({ %s%s; })" % (decls, b[-2].lstrip(":"))
     raise ValueError("no C emission for op: %r" % (op,))
 
 
