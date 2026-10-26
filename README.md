@@ -63,15 +63,26 @@ interp tests: 11/11 passed   (sqr, euclidian_distance, centerSizeInRect)
 
 ## Запуск
 
+```sh
+python3 sexpr_ir_poc.py                                        # движок 1: Python
+SBCL_HOME=/usr/local/sbcl/lib sbcl --load sexexpr_ir_sbcl.lisp \
+  --eval "(ir-poc:main)"                                       # движок 2: Common Lisp
 ```
-python3 sexpr_ir_poc.py
-```
+
+Движок 2 (SBCL): 11/11, gcc OK, avg 0.056 ms/cycle — native reader
+вместо рукописного парсера). Динамический REPL: `SBCL_HOME=... sbcl
+--load sexpr_ir_sbcl.lisp --eval "(ir-poc:repl)"`.
 
 ## Roadmap
 
-- Port на настоящий Common Lisp REPL (SBCL) — зрелый reader,
-  интерактивная валидация (рефлектор памяти говорит: нельзя путать
-  homegrown мини-лисп и CL; это разные валидные пути, выбор за владельцем).
+- [x] Порт на Common Lisp (SBCL) — `sexpr_ir_sbcl.lisp`: 11/11 PASS,
+      gcc OK, 0.056 ms/cycle; два независимых движка дают бит-в-бит
+      одинаковые результаты на одном IR.
 - Расширение корпуса: `integralRect` (NSClipView.m:56),
   `computePeriod` (NSTableView.m:3437) — стресс-тест `:if` на реальных
   ветвлениях из Darling.
+- Clean room на реальном macOS-приложении: цель выбрана — `kekatar`
+  из Keka.app (inline CRC32-таблица с IEEE-полиномом 0xEDB88320,
+  подтверждено по данным бинарника: table[1] = 0x77073096 в обоих
+  слайсах x86_64/arm64); ground truth — публичный IEEE-спек,
+  disassembly-only, без чтения исходников.
