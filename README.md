@@ -1,6 +1,16 @@
+<div align="center">
+
+<img src="docs/banner.svg" alt="sint-ir-poc banner" width="1000">
+
 # SINT IR PoC — двуязычный README / bilingual README
 
+[![Release](https://img.shields.io/github/v/release/kostyk348/sint-ir-poc?sort=semver&color=0ea5e9&label=release)](https://github.com/kostyk348/sint-ir-poc/releases)
+[![Language](https://img.shields.io/badge/lang-Common%20Lisp-blueviolet)](https://github.com/kostyk348/sint-ir-poc)
+
+</div>
+
 ---
+
 
 ## РУССКАЯ ВЕРСИЯ
 
